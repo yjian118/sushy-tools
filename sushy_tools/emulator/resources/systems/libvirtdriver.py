@@ -144,10 +144,13 @@ class LibvirtDriver(AbstractSystemsDriver):
 </volume>
 """
 
+    NAMESPACE = 'http://openstack.org/xmlns/libvirt/sushy'
+
     @classmethod
     def initialize(cls, config, logger, uri=None, *args, **kwargs):
         cls._config = config
         cls._logger = logger
+        cls._domain_filter = config.get("DOMAIN_FILTER")
 
         cls._uri = uri or cls.LIBVIRT_URI
 
@@ -155,8 +158,6 @@ class LibvirtDriver(AbstractSystemsDriver):
             'SUSHY_EMULATOR_BOOT_LOADER_MAP', cls.BOOT_LOADER_MAP)
         cls.KNOWN_BOOT_LOADERS = set(y for x in cls.BOOT_LOADER_MAP.values()
                                      for y in x.values())
-        cls.SUSHY_EMULATOR_IGNORE_BOOT_DEVICE = \
-            cls._config.get('SUSHY_EMULATOR_IGNORE_BOOT_DEVICE', False)
         return cls
 
     @memoize.memoize()
@@ -198,7 +199,10 @@ class LibvirtDriver(AbstractSystemsDriver):
         :returns: list of UUIDs representing the systems
         """
         with libvirt_open(self._uri, readonly=True) as conn:
-            return [domain.UUIDString() for domain in conn.listAllDomains()]
+            domains = [domain.UUIDString() for domain in conn.listAllDomains()]
+            if self._domain_filter:
+                return [self._domain_filter] if self._domain_filter in domains else []
+            return domains
 
     def uuid(self, identity):
         """Get computer system UUID
@@ -250,6 +254,7 @@ class LibvirtDriver(AbstractSystemsDriver):
             if state in ('On', 'ForceOn'):
                 if not domain.isActive():
                     domain.create()
+                    self._add_started_metadata(domain)
             elif state == 'ForceOff':
                 if domain.isActive():
                     domain.destroy()
@@ -284,11 +289,6 @@ class LibvirtDriver(AbstractSystemsDriver):
         :returns: boot device name as `str` or `None` if device name
             can't be determined
         """
-
-        # If not setting Boot devices then just report HDD
-        if self.SUSHY_EMULATOR_IGNORE_BOOT_DEVICE:
-            return constants.DEVICE_TYPE_HDD
-
         domain = self._get_domain(identity, readonly=True)
 
         tree = ET.fromstring(domain.XMLDesc(libvirt.VIR_DOMAIN_XML_INACTIVE))
@@ -354,16 +354,7 @@ class LibvirtDriver(AbstractSystemsDriver):
 
         return boot_source_target
 
-    def _defineDomain(self, tree):
-        try:
-            with libvirt_open(self._uri) as conn:
-                conn.defineXML(ET.tostring(tree).decode('utf-8'))
-        except libvirt.libvirtError as e:
-            msg = ('Error changing boot device at libvirt URI "%(uri)s": '
-                   '%(error)s' % {'uri': self._uri, 'error': e})
-            raise error.FishyError(msg)
-
-    def set_boot_device(self, identity, boot_source):
+    def set_boot_device(self, identity, boot_source, persistence = True):
         """Get/Set computer system boot device name
 
         First remove all boot device configuration from bootloader because
@@ -387,13 +378,6 @@ class LibvirtDriver(AbstractSystemsDriver):
         for os_element in tree.findall('os'):
             for boot_element in os_element.findall('boot'):
                 os_element.remove(boot_element)
-
-            if self.SUSHY_EMULATOR_IGNORE_BOOT_DEVICE:
-                self._logger.warning('Ignoring setting of boot device')
-                boot_element = ET.SubElement(os_element, 'boot')
-                boot_element.set('dev', 'fd')
-                self._defineDomain(tree)
-                return
 
         target = self.DISK_DEVICE_MAP.get(boot_source)
 
@@ -449,12 +433,21 @@ class LibvirtDriver(AbstractSystemsDriver):
             boot_element = ET.SubElement(target_device_element, 'boot')
             boot_element.set('order', str(order + 1))
 
-        self._defineDomain(tree)
+        if not persistence:
+            reboot_element = tree.find('on_reboot')
+            reboot_element.text = "destroy"
+        try:
+            with libvirt_open(self._uri) as conn:
+                conn.defineXML(ET.tostring(tree).decode('utf-8'))
+
+        except libvirt.libvirtError as e:
+            msg = ('Error changing boot device at libvirt URI "%(uri)s": '
+                   '%(error)s' % {'uri': self._uri, 'error': e})
+
+            raise error.FishyError(msg)
 
     def get_boot_mode(self, identity):
         """Get computer system boot mode.
-
-        :param identity: libvirt domain name or ID
 
         :returns: either *UEFI* or *Legacy* as `str` or `None` if
             current boot mode can't be determined
@@ -475,8 +468,6 @@ class LibvirtDriver(AbstractSystemsDriver):
 
     def set_boot_mode(self, identity, boot_mode):
         """Set computer system boot mode.
-
-        :param identity: libvirt domain name or ID
 
         :param boot_mode: string literal requesting boot mode
             change on the system. Valid values are: *UEFI*, *Legacy*.
@@ -591,8 +582,11 @@ class LibvirtDriver(AbstractSystemsDriver):
         :returns: available CPU count as `int` or `None` if CPU count
             can't be determined
         """
-        total_cpus = 0
         domain = self._get_domain(identity, readonly=True)
+
+        tree = ET.fromstring(domain.XMLDesc(libvirt.VIR_DOMAIN_XML_INACTIVE))
+
+        total_cpus = 0
 
         if domain.isActive():
             total_cpus = domain.maxVcpus()
@@ -600,14 +594,27 @@ class LibvirtDriver(AbstractSystemsDriver):
         # If we can't get it from maxVcpus() try to find it by
         # inspecting the domain XML
         if total_cpus <= 0:
-            tree = ET.fromstring(
-                domain.XMLDesc(libvirt.VIR_DOMAIN_XML_INACTIVE))
             vcpu_element = tree.find('.//vcpu')
-
             if vcpu_element is not None:
                 total_cpus = int(vcpu_element.text)
 
         return total_cpus or None
+
+    def _get_metadata_element(self, xml_tree):
+        """Process Libvirt domain XML and return the sushy metadata element
+
+        If the sushy metadata element does not exist return a empty metadata
+        element
+        :param xml_tree: Libvirt domain XML tree to process
+        :returns: the metadata xml element
+        """
+        ET.register_namespace('sushy', self.NAMESPACE)
+        metadata = xml_tree.find('metadata')
+
+        if metadata is None:
+            metadata = ET.SubElement(xml_tree, 'metadata')
+
+        return metadata
 
     def _process_bios_attributes(self,
                                  domain_xml,
@@ -646,15 +653,9 @@ class LibvirtDriver(AbstractSystemsDriver):
             attributes_written: if changes were made to XML,
             bios_attributes: dict of BIOS attributes
         """
-        namespace = 'http://openstack.org/xmlns/libvirt/sushy'
-        ET.register_namespace('sushy', namespace)
-        ns = {'sushy': namespace}
-
+        ns = {'sushy': self.NAMESPACE}
         tree = ET.fromstring(domain_xml)
-        metadata = tree.find('metadata')
-
-        if metadata is None:
-            metadata = ET.SubElement(tree, 'metadata')
+        metadata = self._get_metadata_element(tree)
         bios = metadata.find('sushy:bios', ns)
 
         attributes_written = False
@@ -662,11 +663,11 @@ class LibvirtDriver(AbstractSystemsDriver):
             metadata.remove(bios)
             bios = None
         if bios is None:
-            bios = ET.SubElement(metadata, '{%s}bios' % (namespace))
-            attributes = ET.SubElement(bios, '{%s}attributes' % (namespace))
+            bios = ET.SubElement(metadata, '{%s}bios' % (self.NAMESPACE))
+            attributes = ET.SubElement(bios, '{%s}attributes' % (self.NAMESPACE))
             for key, value in sorted(bios_attributes.items()):
                 ET.SubElement(attributes,
-                              '{%s}attribute' % (namespace),
+                              '{%s}attribute' % (self.NAMESPACE),
                               name=key,
                               value=value)
             attributes_written = True
@@ -710,6 +711,23 @@ class LibvirtDriver(AbstractSystemsDriver):
                 raise error.FishyError(msg)
 
         return result.bios_attributes
+
+    def _add_started_metadata(self, domain):
+        """Add a started element to the sushy metadata.
+
+        This is to indicate to observers that the domain was started by sushy.
+        :param domain: the domain to process
+        """
+        domain_xml = domain.XMLDesc(libvirt.VIR_DOMAIN_XML_INACTIVE)
+        tree = ET.fromstring(domain_xml)
+        metadata = self._get_metadata_element(tree)
+
+        ns = {'sushy': self.NAMESPACE}
+        started = metadata.find('sushy:started', ns)
+        if not started:
+            started = ET.SubElement(metadata, '{%s}started' % (self.NAMESPACE))
+            with libvirt_open(self._uri) as conn:
+                conn.defineXML(ET.tostring(tree).decode('utf-8'))
 
     def get_bios(self, identity):
         """Get BIOS section
@@ -766,45 +784,10 @@ class LibvirtDriver(AbstractSystemsDriver):
                 for iface in tree.findall(
                 ".//devices/interface[@type='network']/mac")]
 
-    def get_processors(self, identity):
-        """Get list of processors
-
-        :param identity: libvirt domain name or ID
-
-        :returns: list of processors dict with their attributes
-        """
-        domain = self._get_domain(identity, readonly=True)
-        processors_count = self.get_total_cpus(identity)
-
-        # NOTE(rpittau) not a lot we can provide if the domain is not active
-        processors = [{'id': 'CPU{0}'.format(x),
-                       'socket': 'CPU {0}'.format(x)}
-                      for x in range(processors_count)]
-
-        if domain.isActive():
-            tree = ET.fromstring(domain.XMLDesc())
-
-            model = tree.find('.//cpu/model').text
-            vendor = tree.find('.//cpu/vendor').text
-            try:
-                cores = tree.find('.//cpu/topology').get('cores')
-                threads = tree.find('.//cpu/topology').get('threads')
-            except AttributeError:
-                cores = 'N/A'
-                threads = 'N/A'
-
-            for processor in processors:
-                processor['model'] = model
-                processor['vendor'] = vendor
-                processor['cores'] = cores
-                processor['threads'] = threads
-
-        return processors
-
     def get_boot_image(self, identity, device):
         """Get backend VM boot image info
 
-        :param identity: libvirt domain name or ID
+        :param identity: node name or ID
         :param device: device type (from
             `sushy_tools.emulator.constants`)
         :returns: a `tuple` of (boot_image, write_protected, inserted)
@@ -944,8 +927,6 @@ class LibvirtDriver(AbstractSystemsDriver):
 
             if controller_type == 'ide':
                 tgt_dev, tgt_bus = self.DEVICE_TARGET_MAP[device]
-            elif lv_device == 'floppy':
-                tgt_dev, tgt_bus = ('fda', 'fdc')
             else:
                 tgt_dev, tgt_bus = ('sdc', controller_type)
 
@@ -1037,7 +1018,7 @@ class LibvirtDriver(AbstractSystemsDriver):
                        write_protected=True):
         """Set backend VM boot image
 
-        :param identity: libvirt domain name or ID
+        :param identity: node name or ID
         :param device: device type (from
             `sushy_tools.emulator.constants`)
         :param boot_image: path to the image file or `None` to remove
@@ -1060,6 +1041,8 @@ class LibvirtDriver(AbstractSystemsDriver):
                                  boot_image, write_protected)
 
             boot_device = self.get_boot_device(identity)
+            # libvirt makes a copy of the image, remove the tempfile
+            os.remove(boot_image)
 
         with libvirt_open(self._uri) as conn:
             xml = ET.tostring(domain_tree)

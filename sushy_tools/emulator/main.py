@@ -16,8 +16,10 @@
 import argparse
 from datetime import datetime
 import functools
+import importlib
 import json
 import os
+import pkgutil
 import ssl
 import sys
 
@@ -112,7 +114,31 @@ class Application(flask.Flask):
         return voldriver.StaticDriver(self.config, self.logger)
 
 
+def register_blueprints(app, package_name, package_path):
+    """Register all Blueprint instances on the specified Flask application found
+    in all modules for the specified package.
+
+    :param app: the Flask application
+    :param package_name: the package name
+    :param package_path: the package path
+    """
+    rv = []
+    test_value = [package_path]
+    for _, name, _ in pkgutil.iter_modules(test_value):
+        m = importlib.import_module('%s.%s' % (package_name, name))
+        for item in dir(m):
+            item = getattr(m, item)
+            if isinstance(item, flask.Blueprint):
+                app.register_blueprint(item)
+            rv.append(item)
+    return rv
+
+
 app = Application()
+
+blueprint_dir = os.path.dirname(
+    pkgutil.get_loader("sushy_tools.emulator.blueprints").path)
+register_blueprints(app, "sushy_tools.emulator.blueprints", blueprint_dir)
 
 
 def instance_denied(**kwargs):
@@ -508,13 +534,17 @@ def system_resource(identity):
 
         if boot:
             target = boot.get('BootSourceOverrideTarget')
+            enabled = boot.get('BootSourceOverrideEnabled')
+            persistence = True
+            if enabled == "Once":
+                persistence = False
 
             if target:
                 # NOTE(lucasagomes): In libvirt we always set the boot
                 # device frequency to "continuous" so, we are ignoring the
                 # BootSourceOverrideEnabled element here
 
-                app.systems.set_boot_device(identity, target)
+                app.systems.set_boot_device(identity, target, persistence)
 
                 app.logger.info('Set boot device to "%s" for system "%s"',
                                 target, identity)
@@ -564,33 +594,6 @@ def ethernet_interface(identity, nic_id):
         if nic['id'] == nic_id:
             return flask.render_template(
                 'ethernet_interface.json', identity=identity, nic=nic)
-
-    return 'Not found', 404
-
-
-@app.route('/redfish/v1/Systems/<identity>/Processors',
-           methods=['GET'])
-@ensure_instance_access
-@returns_json
-def processors_collection(identity):
-    processors = app.systems.get_processors(identity)
-
-    return flask.render_template(
-        'processors_collection.json', identity=identity,
-        processors=processors)
-
-
-@app.route('/redfish/v1/Systems/<identity>/Processors/<processor_id>',
-           methods=['GET'])
-@ensure_instance_access
-@returns_json
-def processor(identity, processor_id):
-    processors = app.systems.get_processors(identity)
-
-    for proc in processors:
-        if proc['id'] == processor_id:
-            return flask.render_template(
-                'processor.json', identity=identity, processor=proc)
 
     return 'Not found', 404
 
@@ -806,8 +809,6 @@ def parse_args():
                         type=str,
                         help='Config file path. Can also be set via '
                              'environment variable SUSHY_EMULATOR_CONFIG.')
-    parser.add_argument('--debug', action='store_true',
-                        help='Enables debug mode when running sushy-emulator.')
     parser.add_argument('-i', '--interface',
                         type=str,
                         help='IP address of the local interface to listen '
@@ -847,8 +848,6 @@ def parse_args():
 def main():
 
     args = parse_args()
-
-    app.debug = args.debug
 
     if args.config:
         app.config.from_pyfile(args.config)

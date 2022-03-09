@@ -185,7 +185,7 @@ class StaticDriver(base.DriverBase):
             'Fetched image %(file)s for %(identity)s' % {
                 'identity': identity, 'file': local_file})
 
-        device_info['Image'] = local_file
+        device_info['Image'] = image_url
         device_info['Inserted'] = inserted
         device_info['WriteProtected'] = write_protected
         device_info['_local_file_path'] = local_file_path
