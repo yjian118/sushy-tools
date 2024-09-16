@@ -145,7 +145,7 @@ class StaticDriver(base.DriverBase):
             with tempfile.NamedTemporaryFile(
                     mode='w+b', delete=False) as tmp_file:
 
-                with requests.get(image_url, stream=True) as rsp:
+                with requests.get(image_url, stream=True, verify=False) as rsp:
 
                     with open(tmp_file.name, 'wb') as fl:
 
